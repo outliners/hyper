@@ -6,7 +6,7 @@ use std::net::{SocketAddr, ToSocketAddrs, TcpStream, TcpListener, Shutdown};
 use std::mem;
 
 #[cfg(feature = "openssl")]
-pub use self::openssl::Openssl;
+pub use self::openssl::{Openssl, OpensslClient, OpensslServer};
 
 use std::time::Duration;
 
@@ -599,7 +599,7 @@ pub type DefaultConnector = HttpConnector;
 
 #[cfg(feature = "openssl")]
 #[doc(hidden)]
-pub type DefaultConnector = HttpsConnector<self::openssl::Openssl>;
+pub type DefaultConnector = HttpsConnector<self::openssl::OpensslClient>;
 
 #[cfg(all(feature = "security-framework", not(feature = "openssl")))]
 pub type DefaultConnector = HttpsConnector<self::security_framework::ClientWrapper>;
@@ -612,11 +612,12 @@ mod openssl {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use openssl::ssl::{Ssl, SslContext, SslStream, SslMethod, SSL_VERIFY_NONE};
+    use openssl::ssl::{Ssl, SslContext, SslStream, SslMethod, SSL_VERIFY_NONE, SSL_VERIFY_PEER};
+    use openssl::ssl::{SSL_OP_NO_COMPRESSION, SSL_OP_NO_SSLV2, SSL_OP_NO_SSLV3, SSL_OP_CIPHER_SERVER_PREFERENCE};
     use openssl::ssl::error::StreamError as SslIoError;
     use openssl::ssl::error::SslError;
     use openssl::x509::X509FileType;
-    use super::{NetworkStream, HttpStream};
+    use super::{NetworkStream, HttpStream, SslClient, SslServer};
 
     /// An implementation of `Ssl` for OpenSSL.
     ///
@@ -638,10 +639,49 @@ mod openssl {
         pub context: Arc<SslContext>
     }
 
+    #[doc(hidden)]
+    pub struct OpensslClient(pub SslContext);
+    #[doc(hidden)]
+    pub struct OpensslServer(pub SslContext);
+
+    /// see https://wiki.mozilla.org/Security/Server_Side_TLS
+    const DEFAULT_CIPHERS: &'static str = concat!(
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:",
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:",
+        "ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:",
+        "ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
+    );
+
+    /// default context options
+    fn context() -> Result<SslContext, SslError> {
+        let mut ctx = try!(SslContext::new(SslMethod::Sslv23));
+        try!(ctx.set_cipher_list(DEFAULT_CIPHERS));
+        ctx.set_options(SSL_OP_NO_COMPRESSION | SSL_OP_NO_SSLV2 | SSL_OP_NO_SSLV3);
+        Ok(ctx)
+    }
+
+    impl Default for OpensslClient {
+        fn default() -> OpensslClient {
+            let mut ctx = context().unwrap();
+            ctx.set_verify(SSL_VERIFY_PEER, None);
+            OpensslClient(ctx)
+        }
+    }
+
+    impl Default for OpensslServer {
+        fn default() -> OpensslServer {
+            let mut ctx = context().unwrap();
+            ctx.set_verify(SSL_VERIFY_NONE, None);
+            ctx.set_options(SSL_OP_CIPHER_SERVER_PREFERENCE);
+            OpensslServer(ctx)
+        }
+    }
+
     impl Default for Openssl {
         fn default() -> Openssl {
             Openssl {
-                context: Arc::new(SslContext::new(SslMethod::Sslv23).unwrap_or_else(|e| {
+                context: Arc::new(context().unwrap_or_else(|e| {
                     // if we cannot create a SslContext, that's because of a
                     // serious problem. just crash.
                     panic!("{}", e)
@@ -654,8 +694,7 @@ mod openssl {
         /// Ease creating an `Openssl` with a certificate and key.
         pub fn with_cert_and_key<C, K>(cert: C, key: K) -> Result<Openssl, SslError>
         where C: AsRef<Path>, K: AsRef<Path> {
-            let mut ctx = try!(SslContext::new(SslMethod::Sslv23));
-            try!(ctx.set_cipher_list("DEFAULT"));
+            let mut ctx = try!(context());
             try!(ctx.set_certificate_file(cert.as_ref(), X509FileType::PEM));
             try!(ctx.set_private_key_file(key.as_ref(), X509FileType::PEM));
             ctx.set_verify(SSL_VERIFY_NONE, None);
@@ -674,6 +713,30 @@ mod openssl {
 
         fn wrap_server(&self, stream: HttpStream) -> ::Result<Self::Stream> {
             match SslStream::accept(&*self.context, stream) {
+                Ok(ssl_stream) => Ok(ssl_stream),
+                Err(SslIoError(e)) => {
+                    Err(io::Error::new(io::ErrorKind::ConnectionAborted, e).into())
+                },
+                Err(e) => Err(e.into())
+            }
+        }
+    }
+
+    impl SslClient for OpensslClient {
+        type Stream = SslStream<HttpStream>;
+
+        fn wrap_client(&self, stream: HttpStream, host: &str) -> ::Result<Self::Stream> {
+            let ssl = try!(Ssl::new(&self.0));
+            try!(ssl.set_hostname(host));
+            SslStream::connect(ssl, stream).map_err(From::from)
+        }
+    }
+
+    impl SslServer for OpensslServer {
+        type Stream = SslStream<HttpStream>;
+
+        fn wrap_server(&self, stream: HttpStream) -> ::Result<Self::Stream> {
+            match SslStream::accept(&self.0, stream) {
                 Ok(ssl_stream) => Ok(ssl_stream),
                 Err(SslIoError(e)) => {
                     Err(io::Error::new(io::ErrorKind::ConnectionAborted, e).into())
