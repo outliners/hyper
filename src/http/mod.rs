@@ -17,7 +17,7 @@ use version::HttpVersion::{Http10, Http11};
 #[cfg(feature = "serde-serialization")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use self::conn::{Conn, MessageHandler, MessageHandlerFactory, Seed, Key};
+pub use self::conn::{Conn, MessageHandler, MessageHandlerFactory, Seed, Key, ReadyResult};
 
 mod buffer;
 pub mod channel;
@@ -72,6 +72,31 @@ impl<'a, T: Read> Decoder<'a, T> {
         Decoder(DecoderImpl::H1(decoder, transport))
     }
 
+    /// Read from the `Transport`.
+    #[inline]
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.0 {
+            DecoderImpl::H1(ref mut decoder, ref mut transport) => {
+                decoder.decode(transport, buf)
+            }
+        }
+    }
+
+    /// Try to read from the `Transport`.
+    ///
+    /// This method looks for the `WouldBlock` error. If the read did not block,
+    /// a return value would be `Ok(Some(x))`. If the read would block,
+    /// this method would return `Ok(None)`.
+    #[inline]
+    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        match self.read(buf) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) => match e.kind() {
+                io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(e)
+            }
+        }
+    }
 
     /// Get a reference to the transport.
     pub fn get_ref(&self) -> &T {
@@ -86,9 +111,42 @@ impl<'a, T: Transport> Encoder<'a, T> {
         Encoder(EncoderImpl::H1(encoder, transport))
     }
 
+    /// Write to the `Transport`.
+    #[inline]
+    pub fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        match self.0 {
+            EncoderImpl::H1(ref mut encoder, ref mut transport) => {
+                if encoder.is_closed() {
+                    Ok(0)
+                } else {
+                    encoder.encode(*transport, data)
+                }
+            }
+        }
+    }
+
+    /// Try to write to the `Transport`.
+    ///
+    /// This method looks for the `WouldBlock` error. If the write did not block,
+    /// a return value would be `Ok(Some(x))`. If the write would block,
+    /// this method would return `Ok(None)`.
+    #[inline]
+    pub fn try_write(&mut self, data: &[u8]) -> io::Result<Option<usize>> {
+        match self.write(data) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) => match e.kind() {
+                io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(e)
+            }
+        }
+    }
+
     /// Closes an encoder, signaling that no more writing will occur.
     ///
-    /// This is needed for encodings that don't know length of the content
+    /// This is needed for encodings that don't know the length of the content
     /// beforehand. Most common instance would be usage of
     /// `Transfer-Enciding: chunked`. You would call `close()` to signal
     /// the `Encoder` should write the end chunk, or `0\r\n\r\n`.
@@ -109,29 +167,14 @@ impl<'a, T: Transport> Encoder<'a, T> {
 impl<'a, T: Read> Read for Decoder<'a, T> {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.0 {
-            DecoderImpl::H1(ref mut decoder, ref mut transport) => {
-                decoder.decode(transport, buf)
-            }
-        }
+        self.read(buf)
     }
 }
 
 impl<'a, T: Transport> Write for Encoder<'a, T> {
     #[inline]
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-        match self.0 {
-            EncoderImpl::H1(ref mut encoder, ref mut transport) => {
-                if encoder.is_closed() {
-                    Ok(0)
-                } else {
-                    encoder.encode(*transport, data)
-                }
-            }
-        }
+        self.write(data)
     }
 
     #[inline]
@@ -249,14 +292,16 @@ impl Deserialize for RawStatus {
 /// Checks if a connection should be kept alive.
 #[inline]
 pub fn should_keep_alive(version: HttpVersion, headers: &Headers) -> bool {
-    trace!("should_keep_alive( {:?}, {:?} )", version, headers.get::<Connection>());
-    match (version, headers.get::<Connection>()) {
+    let ret = match (version, headers.get::<Connection>()) {
         (Http10, None) => false,
         (Http10, Some(conn)) if !conn.contains(&KeepAlive) => false,
         (Http11, Some(conn)) if conn.contains(&Close)  => false,
         _ => true
-    }
+    };
+    trace!("should_keep_alive(version={:?}, header={:?}) = {:?}", version, headers.get::<Connection>(), ret);
+    ret
 }
+
 pub type ParseResult<T> = ::Result<Option<(MessageHead<T>, usize)>>;
 
 pub fn parse<T: Http1Message<Incoming=I>, I>(rdr: &[u8]) -> ParseResult<I> {
@@ -278,12 +323,9 @@ pub enum ClientMessage {}
 pub trait Http1Message {
     type Incoming;
     type Outgoing: Default;
-    //TODO: replace with associated const when stable
-    fn initial_interest() -> Next;
     fn parse(bytes: &[u8]) -> ParseResult<Self::Incoming>;
     fn decoder(head: &MessageHead<Self::Incoming>) -> ::Result<h1::Decoder>;
     fn encode(head: MessageHead<Self::Outgoing>, dst: &mut Vec<u8>) -> h1::Encoder;
-
 }
 
 /// Used to signal desired events when working with asynchronous IO.
@@ -304,6 +346,7 @@ impl fmt::Debug for Next {
     }
 }
 
+// Internal enum for `Next`
 #[derive(Debug, Clone, Copy)]
 enum Next_ {
     Read,
@@ -314,6 +357,8 @@ enum Next_ {
     Remove,
 }
 
+// An enum representing all the possible actions to taken when registering
+// with the event loop.
 #[derive(Debug, Clone, Copy)]
 enum Reg {
     Read,
@@ -361,16 +406,11 @@ impl Next {
         }
     }
 
-    fn interest(&self) -> Reg {
-        match self.interest {
-            Next_::Read => Reg::Read,
-            Next_::Write => Reg::Write,
-            Next_::ReadWrite => Reg::ReadWrite,
-            Next_::Wait => Reg::Wait,
-            Next_::End => Reg::Remove,
-            Next_::Remove => Reg::Remove,
-        }
+    /*
+    fn reg(&self) -> Reg {
+        self.interest.register()
     }
+    */
 
     /// Signals the desire to read from the transport.
     pub fn read() -> Next {
@@ -407,6 +447,19 @@ impl Next {
     pub fn timeout(mut self, dur: Duration) -> Next {
         self.timeout = Some(dur);
         self
+    }
+}
+
+impl Next_ {
+    fn register(&self) -> Reg {
+        match *self {
+            Next_::Read => Reg::Read,
+            Next_::Write => Reg::Write,
+            Next_::ReadWrite => Reg::ReadWrite,
+            Next_::Wait => Reg::Wait,
+            Next_::End => Reg::Remove,
+            Next_::Remove => Reg::Remove,
+        }
     }
 }
 

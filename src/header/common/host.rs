@@ -1,6 +1,8 @@
-use header::{Header};
+use header::{Header, Raw};
 use std::fmt;
+use std::str::FromStr;
 use header::parsing::from_one_raw_str;
+use url::idna::domain_to_unicode;
 
 /// The `Host` header.
 ///
@@ -47,39 +49,8 @@ impl Header for Host {
         NAME
     }
 
-    fn parse_header(raw: &[Vec<u8>]) -> ::Result<Host> {
-        from_one_raw_str(raw).and_then(|mut s: String| {
-            // FIXME: use rust-url to parse this
-            // https://github.com/servo/rust-url/issues/42
-            let idx = {
-                let slice = &s[..];
-                if slice.starts_with('[') {
-                    match slice.rfind(']') {
-                        Some(idx) => {
-                            if slice.len() > idx + 2 {
-                                Some(idx + 1)
-                            } else {
-                                None
-                            }
-                        }
-                        None => return Err(::Error::Header) // this is a bad ipv6 address...
-                    }
-                } else {
-                    slice.rfind(':')
-                }
-            };
-
-            let port = idx.and_then(|idx| s[idx + 1..].parse().ok());
-
-            if let Some(idx) = idx {
-                s.truncate(idx)
-            }
-
-            Ok(Host {
-                hostname: s,
-                port: port
-            })
-        })
+    fn parse_header(raw: &Raw) -> ::Result<Host> {
+       from_one_raw_str(raw)
     }
 
     fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -87,6 +58,45 @@ impl Header for Host {
             None | Some(80) | Some(443) => f.write_str(&self.hostname[..]),
             Some(port) => write!(f, "{}:{}", self.hostname, port)
         }
+    }
+}
+
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.fmt_header(f)
+    }
+}
+
+impl FromStr for Host {
+    type Err = ::Error;
+
+    fn from_str(s: &str) -> ::Result<Host> {
+        let idx = s.rfind(':');
+        let port = idx.and_then(
+            |idx| s[idx + 1..].parse().ok()
+        );
+        let hostname_encoded = match port {
+            None => s,
+            Some(_) => &s[..idx.unwrap()]
+        };
+
+        let hostname = if hostname_encoded.starts_with("[") {
+            if !hostname_encoded.ends_with("]") {
+                return Err(::Error::Header)
+            }
+            hostname_encoded.to_owned()
+        } else {
+            let (hostname, res) = domain_to_unicode(hostname_encoded);
+            if res.is_err() {
+                return Err(::Error::Header)
+            }
+            hostname
+        };
+
+        Ok(Host {
+            hostname: hostname,
+            port: port
+        })
     }
 }
 
@@ -98,17 +108,35 @@ mod tests {
 
     #[test]
     fn test_host() {
-        let host = Header::parse_header([b"foo.com".to_vec()].as_ref());
+        let host = Header::parse_header(&vec![b"foo.com".to_vec()].into());
         assert_eq!(host.ok(), Some(Host {
             hostname: "foo.com".to_owned(),
             port: None
         }));
 
 
-        let host = Header::parse_header([b"foo.com:8080".to_vec()].as_ref());
+        let host = Header::parse_header(&vec![b"foo.com:8080".to_vec()].into());
         assert_eq!(host.ok(), Some(Host {
             hostname: "foo.com".to_owned(),
             port: Some(8080)
+        }));
+
+        let host = Header::parse_header(&vec![b"foo.com".to_vec()].into());
+        assert_eq!(host.ok(), Some(Host {
+            hostname: "foo.com".to_owned(),
+            port: None
+        }));
+
+        let host = Header::parse_header(&vec![b"[::1]:8080".to_vec()].into());
+        assert_eq!(host.ok(), Some(Host {
+            hostname: "[::1]".to_owned(),
+            port: Some(8080)
+        }));
+
+        let host = Header::parse_header(&vec![b"[::1]".to_vec()].into());
+        assert_eq!(host.ok(), Some(Host {
+            hostname: "[::1]".to_owned(),
+            port: None
         }));
     }
 }

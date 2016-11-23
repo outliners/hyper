@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use hyper::{Next, Encoder, Decoder};
-use hyper::net::HttpStream;
+use hyper::net::{HttpListener, HttpStream};
 use hyper::server::{Server, Handler, Request, Response};
 
 struct Serve {
@@ -17,8 +17,14 @@ struct Serve {
 }
 
 impl Serve {
+    fn addrs(&self) -> &[SocketAddr] {
+        self.listening.as_ref().unwrap().addrs()
+    }
+
     fn addr(&self) -> &SocketAddr {
-        self.listening.as_ref().unwrap().addr()
+        let addrs = self.addrs();
+        assert!(addrs.len() == 1);
+        &addrs[0]
     }
 
     /*
@@ -72,7 +78,7 @@ impl Drop for Serve {
 
 struct TestHandler {
     tx: mpsc::Sender<Msg>,
-    rx: mpsc::Receiver<Reply>,
+    reply: Vec<Reply>,
     peeked: Option<Vec<u8>>,
     timeout: Option<Duration>,
 }
@@ -123,28 +129,26 @@ impl Handler<HttpStream> for TestHandler {
     }
 
     fn on_response(&mut self, res: &mut Response) -> Next {
-        loop {
-            match self.rx.try_recv() {
-                Ok(Reply::Status(s)) => {
+        for reply in self.reply.drain(..) {
+            match reply {
+                Reply::Status(s) => {
                     res.set_status(s);
                 },
-                Ok(Reply::Headers(headers)) => {
+                Reply::Headers(headers) => {
                     use std::iter::Extend;
                     res.headers_mut().extend(headers.iter());
                 },
-                Ok(Reply::Body(body)) => {
+                Reply::Body(body) => {
                     self.peeked = Some(body);
-                },
-                Err(..) => {
-                    return if self.peeked.is_some() {
-                        self.next(Next::write())
-                    } else {
-                        self.next(Next::end())
-                    };
                 },
             }
         }
 
+        if self.peeked.is_some() {
+            self.next(Next::write())
+        } else {
+            self.next(Next::end())
+        }
     }
 
     fn on_response_writable(&mut self, encoder: &mut Encoder<HttpStream>) -> Next {
@@ -163,21 +167,37 @@ fn serve() -> Serve {
 }
 
 fn serve_with_timeout(dur: Option<Duration>) -> Serve {
+    serve_n_with_timeout(1, dur)
+}
+
+fn serve_n(n: u32) -> Serve {
+    serve_n_with_timeout(n, None)
+}
+
+fn serve_n_with_timeout(n: u32, dur: Option<Duration>) -> Serve {
     use std::thread;
 
     let (msg_tx, msg_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
-    let mut reply_rx = Some(reply_rx);
-    let (listening, server) = Server::http(&"127.0.0.1:0".parse().unwrap()).unwrap()
-        .handle(move |_| TestHandler {
-            tx: msg_tx.clone(),
-            timeout: dur,
-            rx: reply_rx.take().unwrap(),
-            peeked: None,
+
+    let addr = "127.0.0.1:0".parse().unwrap();
+    let listeners = (0..n).map(|_| HttpListener::bind(&addr).unwrap());
+    let (listening, server) = Server::new(listeners)
+        .handle(move |_| {
+            let mut replies = Vec::new();
+            while let Ok(reply) = reply_rx.try_recv() {
+                replies.push(reply);
+            }
+            TestHandler {
+                tx: msg_tx.clone(),
+                timeout: dur,
+                reply: replies,
+                peeked: None,
+            }
         }).unwrap();
 
 
-    let thread_name = format!("test-server-{}: {:?}", listening.addr(), dur);
+    let thread_name = format!("test-server-{}: {:?}", listening, dur);
     thread::Builder::new().name(thread_name).spawn(move || {
         server.run();
     }).unwrap();
@@ -376,4 +396,86 @@ fn server_empty_response_chunked_without_calling_write() {
     assert_eq!(lines.next(), Some("0"));
     assert_eq!(lines.next(), Some(""));
     assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn server_keep_alive() {
+    extern crate env_logger;
+    env_logger::init().unwrap();
+
+    let foo_bar = b"foo bar baz";
+    let server = serve();
+    server.reply()
+        .status(hyper::Ok)
+        .header(hyper::header::ContentLength(foo_bar.len() as u64))
+        .body(foo_bar);
+    let mut req = TcpStream::connect(server.addr()).unwrap();
+    req.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    req.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    req.write_all(b"\
+        GET / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Connection: keep-alive\r\n\
+        \r\n\
+    ").expect("writing 1");
+
+    let mut buf = [0; 1024 * 8];
+    loop {
+        let n = req.read(&mut buf[..]).expect("reading 1");
+        if n < buf.len() {
+            if &buf[n - foo_bar.len()..n] == foo_bar {
+                break;
+            } else {
+                println!("{:?}", ::std::str::from_utf8(&buf[..n]));
+            }
+        }
+    }
+
+    // try again!
+
+    let quux = b"zar quux";
+    server.reply()
+        .status(hyper::Ok)
+        .header(hyper::header::ContentLength(quux.len() as u64))
+        .body(quux);
+    req.write_all(b"\
+        GET /quux HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Connection: close\r\n\
+        \r\n\
+    ").expect("writing 2");
+
+    let mut buf = [0; 1024 * 8];
+    loop {
+        let n = req.read(&mut buf[..]).expect("reading 2");
+        assert!(n > 0, "n = {}", n);
+        if n < buf.len() {
+            if &buf[n - quux.len()..n] == quux {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn server_get_with_body_three_listeners() {
+    let server = serve_n(3);
+    let addrs = server.addrs();
+    assert_eq!(addrs.len(), 3);
+
+    for (i, addr) in addrs.iter().enumerate() {
+        let mut req = TcpStream::connect(addr).unwrap();
+        write!(req, "\
+            GET / HTTP/1.1\r\n\
+            Host: example.domain\r\n\
+            Content-Length: 17\r\n\
+            \r\n\
+            I'm sending to {}.\r\n\
+        ", i).unwrap();
+        req.read(&mut [0; 256]).unwrap();
+
+        // note: doesnt include trailing \r\n, cause Content-Length wasn't 19
+        let comparison = format!("I'm sending to {}.", i).into_bytes();
+        assert_eq!(server.body(), comparison);
+    }
 }

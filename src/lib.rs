@@ -13,6 +13,8 @@
 //! Hyper provides both a [Client](client/index.html) and a
 //! [Server](server/index.html), along with a
 //! [typed Headers system](header/index.html).
+//!
+//! If just getting started, consider looking over the **[Guide](../guide/)**.
 extern crate rustc_serialize as serialize;
 extern crate time;
 #[macro_use] extern crate url;
@@ -29,8 +31,6 @@ extern crate unicase;
 extern crate httparse;
 extern crate rotor;
 extern crate spmc;
-extern crate traitobject;
-extern crate typeable;
 extern crate vecio;
 
 #[macro_use]
@@ -49,14 +49,14 @@ extern crate test;
 pub use url::Url;
 pub use client::Client;
 pub use error::{Result, Error};
-pub use http::{Next, Encoder, Decoder, Control, ControlError};
 pub use header::Headers;
+pub use http::{Next, Encoder, Decoder, Control, ControlError};
 pub use method::Method::{self, Get, Head, Post, Delete};
+pub use net::{HttpStream, Transport};
 pub use status::StatusCode::{self, Ok, BadRequest, NotFound};
 pub use server::Server;
 pub use uri::RequestUri;
 pub use version::HttpVersion;
-pub use language_tags::LanguageTag;
 
 macro_rules! rotor_try {
     ($e:expr) => ({

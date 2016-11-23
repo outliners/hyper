@@ -1,10 +1,10 @@
 use std::borrow::Cow;
-use std::io::Write;
+use std::fmt::{self, Write};
 
 use httparse;
 
 use header::{self, Headers, ContentLength, TransferEncoding};
-use http::{MessageHead, RawStatus, Http1Message, ParseResult, Next, ServerMessage, ClientMessage, Next_, RequestLine};
+use http::{MessageHead, RawStatus, Http1Message, ParseResult, ServerMessage, ClientMessage, RequestLine};
 use http::h1::{Encoder, Decoder};
 use method::Method;
 use status::StatusCode;
@@ -26,10 +26,6 @@ pub fn parse<T: Http1Message<Incoming=I>, I>(buf: &[u8]) -> ParseResult<I> {
 impl Http1Message for ServerMessage {
     type Incoming = RequestLine;
     type Outgoing = StatusCode;
-
-    fn initial_interest() -> Next {
-        Next::new(Next_::Read)
-    }
 
     fn parse(buf: &[u8]) -> ParseResult<RequestLine> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -99,8 +95,12 @@ impl Http1Message for ServerMessage {
         let init_cap = 30 + head.headers.len() * AVERAGE_HEADER_SIZE;
         dst.reserve(init_cap);
         debug!("writing {:#?}", head.headers);
-        let _ = write!(dst, "{} {}\r\n{}\r\n", head.version, head.subject, head.headers);
-
+        if head.version == ::HttpVersion::Http11 && head.subject == ::StatusCode::Ok {
+            extend(dst, b"HTTP/1.1 200 OK\r\n");
+            let _ = write!(FastWrite(dst), "{}\r\n", head.headers);
+        } else {
+            let _ = write!(FastWrite(dst), "{} {}\r\n{}\r\n", head.version, head.subject, head.headers);
+        }
         body
     }
 }
@@ -108,11 +108,6 @@ impl Http1Message for ServerMessage {
 impl Http1Message for ClientMessage {
     type Incoming = RawStatus;
     type Outgoing = RequestLine;
-
-
-    fn initial_interest() -> Next {
-        Next::new(Next_::Write)
-    }
 
     fn parse(buf: &[u8]) -> ParseResult<RawStatus> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -204,9 +199,34 @@ impl Http1Message for ClientMessage {
         let init_cap = 30 + head.headers.len() * AVERAGE_HEADER_SIZE;
         dst.reserve(init_cap);
         debug!("writing {:#?}", head.headers);
-        let _ = write!(dst, "{} {}\r\n{}\r\n", head.subject, head.version, head.headers);
+        let _ = write!(FastWrite(dst), "{} {}\r\n{}\r\n", head.subject, head.version, head.headers);
 
         body
+    }
+}
+
+struct FastWrite<'a>(&'a mut Vec<u8>);
+
+impl<'a> fmt::Write for FastWrite<'a> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        extend(self.0, s.as_bytes());
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments) -> fmt::Result {
+        fmt::write(self, args)
+    }
+}
+
+fn extend(dst: &mut Vec<u8>, data: &[u8]) {
+    use std::ptr;
+    dst.reserve(data.len());
+    let prev = dst.len();
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(),
+                                 dst.as_mut_ptr().offset(prev as isize),
+                                 data.len());
+        dst.set_len(prev + data.len());
     }
 }
 

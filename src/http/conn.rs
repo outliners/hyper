@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::time::Duration;
 
-use rotor::{self, EventSet, PollOpt, Scope};
+use rotor::{self, EventSet, PollOpt, Scope, Time};
 
 use http::{self, h1, Http1Message, Encoder, Decoder, Next, Next_, Reg, Control};
 use http::channel;
@@ -37,6 +37,10 @@ struct ConnInner<K: Key, T: Transport, H: MessageHandler<T>> {
     key: K,
     state: State<H, T>,
     transport: T,
+    /// Records a WouldBlock error when trying to read
+    ///
+    /// This flag is used to prevent busy looping
+    read_would_block: bool,
 }
 
 impl<K: Key, T: Transport, H: MessageHandler<T>> fmt::Debug for ConnInner<K, T, H> {
@@ -63,8 +67,8 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
     fn interest(&self) -> Reg {
         match self.state {
             State::Closed => Reg::Remove,
-            State::Init => {
-                <H as MessageHandler>::Message::initial_interest().interest()
+            State::Init { interest, .. } => {
+                interest.register()
             }
             State::Http1(Http1 { reading: Reading::Closed, writing: Writing::Closed, .. }) => {
                 Reg::Remove
@@ -117,10 +121,16 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
     }
 
     fn parse(&mut self) -> ::Result<http::MessageHead<<<H as MessageHandler<T>>::Message as Http1Message>::Incoming>> {
-        let n = try!(self.buf.read_from(&mut self.transport));
-        if n == 0 {
-            trace!("parse eof");
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "parse eof").into());
+        match self.buf.read_from(&mut self.transport) {
+            Ok(0) => {
+                trace!("parse eof");
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "parse eof").into());
+            }
+            Ok(_) => {},
+            Err(e) => match e.kind() {
+                io::ErrorKind::WouldBlock => {},
+                _ => return Err(e.into())
+            }
         }
         match try!(http::parse::<<H as MessageHandler<T>>::Message, _>(self.buf.bytes())) {
             Some((head, len)) => {
@@ -142,12 +152,15 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
 
     fn read<F: MessageHandlerFactory<K, T, Output=H>>(&mut self, scope: &mut Scope<F>, state: State<H, T>) -> State<H, T> {
          match state {
-            State::Init => {
+            State::Init { interest: Next_::Read, .. } => {
                 let head = match self.parse() {
                     Ok(head) => head,
                     Err(::Error::Io(e)) => match e.kind() {
                         io::ErrorKind::WouldBlock |
-                        io::ErrorKind::Interrupted => return State::Init,
+                        io::ErrorKind::Interrupted => {
+                            self.read_would_block = true;
+                            return state;
+                        },
                         _ => {
                             debug!("io error trying to parse {:?}", e);
                             return State::Closed;
@@ -159,14 +172,18 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                         return State::Closed;
                     }
                 };
-                match <<H as MessageHandler<T>>::Message as Http1Message>::decoder(&head) {
+                let mut handler = match scope.create(Seed(&self.key, &self.ctrl.0)) {
+                    Some(handler) => handler,
+                    None => unreachable!()
+                };
+                match H::Message::decoder(&head) {
                     Ok(decoder) => {
                         trace!("decoder = {:?}", decoder);
                         let keep_alive = self.keep_alive_enabled && head.should_keep_alive();
-                        let mut handler = scope.create(Seed(&self.key, &self.ctrl.0));
                         let next = handler.on_incoming(head, &self.transport);
                         trace!("handler.on_incoming() -> {:?}", next);
 
+                        let now = scope.now();
                         match next.interest {
                             Next_::Read => self.read(scope, State::Http1(Http1 {
                                 handler: handler,
@@ -174,6 +191,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                                 writing: Writing::Init,
                                 keep_alive: keep_alive,
                                 timeout: next.timeout,
+                                timeout_start: Some(now),
                                 _marker: PhantomData,
                             })),
                             Next_::Write => State::Http1(Http1 {
@@ -190,6 +208,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                                 writing: Writing::Head,
                                 keep_alive: keep_alive,
                                 timeout: next.timeout,
+                                timeout_start: Some(now),
                                 _marker: PhantomData,
                             }),
                             Next_::ReadWrite => self.read(scope, State::Http1(Http1 {
@@ -198,6 +217,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                                 writing: Writing::Head,
                                 keep_alive: keep_alive,
                                 timeout: next.timeout,
+                                timeout_start: Some(now),
                                 _marker: PhantomData,
                             })),
                             Next_::Wait => State::Http1(Http1 {
@@ -206,6 +226,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                                 writing: Writing::Init,
                                 keep_alive: keep_alive,
                                 timeout: next.timeout,
+                                timeout_start: Some(now),
                                 _marker: PhantomData,
                             }),
                             Next_::End |
@@ -214,16 +235,47 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                     },
                     Err(e) => {
                         debug!("error creating decoder: {:?}", e);
-                        //TODO: respond with 400
+                        //TODO: update state from returned Next
+                        //this would allow a Server to respond with a proper
+                        //4xx code
+                        let _ = handler.on_error(e);
                         State::Closed
                     }
                 }
+            },
+            State::Init { interest: Next_::Wait, .. } => {
+                match self.buf.read_from(&mut self.transport) {
+                    Ok(0) => {
+                        // End-of-file; connection was closed by peer
+                        State::Closed
+                    },
+                    Ok(n) => {
+                        // Didn't expect bytes here! Close the connection.
+                        warn!("read {} bytes in State::Init with Wait interest", n);
+                        State::Closed
+                    },
+                    Err(e) => match e.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            // This is the expected case reading in this state
+                            self.read_would_block = true;
+                            state
+                        },
+                        _ => {
+                            warn!("socket error reading State::Init with Wait interest: {}", e);
+                            State::Closed
+                        }
+                    }
+                }
+            },
+            State::Init { .. } => {
+                trace!("on_readable State::{:?}", state);
+                state
             },
             State::Http1(mut http1) => {
                 let next = match http1.reading {
                     Reading::Init => None,
                     Reading::Parse => match self.parse() {
-                        Ok(head) => match <<H as MessageHandler<T>>::Message as Http1Message>::decoder(&head) {
+                        Ok(head) => match H::Message::decoder(&head) {
                             Ok(decoder) => {
                                 trace!("decoder = {:?}", decoder);
                                 // if client request asked for keep alive,
@@ -244,15 +296,18 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                         },
                         Err(::Error::Io(e)) => match e.kind() {
                             io::ErrorKind::WouldBlock |
-                            io::ErrorKind::Interrupted => None,
+                            io::ErrorKind::Interrupted => {
+                                self.read_would_block = true;
+                                None
+                            },
                             _ => {
                                 debug!("io error trying to parse {:?}", e);
                                 return State::Closed;
                             }
                         },
                         Err(e) => {
-                            //TODO: send proper error codes depending on error
                             trace!("parse error: {:?}", e);
+                            let _ = http1.handler.on_error(e);
                             return State::Closed;
                         }
                     },
@@ -272,9 +327,9 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                 };
                 let mut s = State::Http1(http1);
                 if let Some(next) = next {
-                    s.update(next);
+                    s.update(next, &**scope, Some(scope.now()));
                 }
-                trace!("Conn.on_readable State::Http1 completed, new state = {:?}", s);
+                trace!("Conn.on_readable State::Http1 completed, new state = State::{:?}", s);
 
                 let again = match s {
                     State::Http1(Http1 { reading: Reading::Body(ref encoder), .. }) => encoder.is_eof(),
@@ -296,13 +351,19 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
 
     fn write<F: MessageHandlerFactory<K, T, Output=H>>(&mut self, scope: &mut Scope<F>, mut state: State<H, T>) -> State<H, T> {
         let next = match state {
-            State::Init => {
-                // this could be a Client request, which writes first, so pay
+            State::Init { interest: Next_::Write, .. } => {
+                // this is a Client request, which writes first, so pay
                 // attention to the version written here, which will adjust
                 // our internal state to Http1 or Http2
-                let mut handler = scope.create(Seed(&self.key, &self.ctrl.0));
+                let mut handler = match scope.create(Seed(&self.key, &self.ctrl.0)) {
+                    Some(handler) => handler,
+                    None => {
+                        trace!("could not create handler {:?}", self.key);
+                        return State::Closed;
+                    }
+                };
                 let mut head = http::MessageHead::default();
-                let interest = handler.on_outgoing(&mut head);
+                let mut interest = handler.on_outgoing(&mut head);
                 if head.version == HttpVersion::Http11 {
                     let mut buf = Vec::new();
                     let keep_alive = self.keep_alive_enabled && head.should_keep_alive();
@@ -317,6 +378,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                                 bytes: buf,
                                 pos: 0
                             });
+                            interest = handler.on_encode(&mut Encoder::h1(&mut encoder, &mut self.transport));
                             Writing::Ready(encoder)
                         },
                         _ => Writing::Chunk(Chunk {
@@ -331,10 +393,15 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                         handler: handler,
                         keep_alive: keep_alive,
                         timeout: interest.timeout,
+                        timeout_start: Some(scope.now()),
                         _marker: PhantomData,
                     })
                 }
                 Some(interest)
+            }
+            State::Init { .. } => {
+                trace!("Conn.on_writable State::{:?}", state);
+                None
             }
             State::Http1(Http1 { ref mut handler, ref mut writing, ref mut keep_alive, .. }) => {
                 match *writing {
@@ -344,7 +411,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                     }
                     Writing::Head => {
                         let mut head = http::MessageHead::default();
-                        let interest = handler.on_outgoing(&mut head);
+                        let mut interest = handler.on_outgoing(&mut head);
                         // if the request wants to close, server cannot stop it
                         if *keep_alive {
                             // if the request wants to stay alive, then it depends
@@ -363,6 +430,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
                                     bytes: buf,
                                     pos: 0
                                 });
+                                interest = handler.on_encode(&mut Encoder::h1(&mut encoder, &mut self.transport));
                                 Writing::Ready(encoder)
                             },
                             _ => Writing::Chunk(Chunk {
@@ -419,31 +487,38 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
         };
 
         if let Some(next) = next {
-            state.update(next);
+            state.update(next, &**scope, Some(scope.now()));
         }
         state
     }
 
-    fn can_read_more(&self) -> bool {
-        match self.state {
-            State::Init => false,
+    fn can_read_more(&self, was_init: bool) -> bool {
+        let transport_blocked = self.transport.blocked().is_some();
+        let read_would_block = self.read_would_block;
+
+        let state_machine_ok = match self.state {
+            State::Init { .. } => !was_init && !self.buf.is_empty(),
             _ => !self.buf.is_empty()
-        }
+        };
+
+        !transport_blocked && !read_would_block && state_machine_ok
     }
 
-    fn on_error(&mut self, err: ::Error) {
+    fn on_error<F>(&mut self, err: ::Error, factory: &F) where F: MessageHandlerFactory<K, T> {
         debug!("on_error err = {:?}", err);
         trace!("on_error state = {:?}", self.state);
         let next = match self.state {
-            State::Init => Next::remove(),
+            State::Init { .. } => Next::remove(),
             State::Http1(ref mut http1) => http1.handler.on_error(err),
             State::Closed => Next::remove(),
         };
-        self.state.update(next);
+        self.state.update(next, factory, None);
     }
 
     fn on_readable<F>(&mut self, scope: &mut Scope<F>)
     where F: MessageHandlerFactory<K, T, Output=H> {
+        // Clear would_block flag so state is clear going into read
+        self.read_would_block = false;
         trace!("on_readable -> {:?}", self.state);
         let state = mem::replace(&mut self.state, State::Closed);
         self.state = self.read(scope, state);
@@ -461,22 +536,38 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
     fn on_remove(self) {
         debug!("on_remove");
         match self.state {
-            State::Init | State::Closed => (),
+            State::Init { .. } | State::Closed => (),
             State::Http1(http1) => http1.handler.on_remove(self.transport),
         }
     }
 
 }
 
+pub enum ReadyResult<C> {
+    Continue(C),
+    Done(Option<(C, Option<Duration>)>)
+}
+
 impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
-    pub fn new(key: K, transport: T, notify: rotor::Notifier) -> Conn<K, T, H> {
+    pub fn new(
+        key: K,
+        transport: T,
+        next: Next,
+        notify: rotor::Notifier,
+        now: Time
+    ) -> Conn<K, T, H> {
         Conn(Box::new(ConnInner {
             buf: Buffer::new(),
             ctrl: channel::new(notify),
             keep_alive_enabled: true,
             key: key,
-            state: State::Init,
+            state: State::Init {
+                interest: next.interest,
+                timeout: next.timeout,
+                timeout_start: Some(now),
+            },
             transport: transport,
+            read_would_block: false,
         }))
     }
 
@@ -485,8 +576,13 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
         self
     }
 
-    pub fn ready<F>(mut self, events: EventSet, scope: &mut Scope<F>) -> Option<(Self, Option<Duration>)>
-    where F: MessageHandlerFactory<K, T, Output=H> {
+    pub fn ready<F>(
+        mut self,
+        events: EventSet,
+        scope: &mut Scope<F>
+    ) -> ReadyResult<Self>
+        where F: MessageHandlerFactory<K, T, Output=H>
+    {
         trace!("Conn::ready events='{:?}', blocked={:?}", events, self.0.transport.blocked());
 
         if events.is_error() {
@@ -495,7 +591,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
                     trace!("is_error, but not socket error");
                     // spurious?
                 },
-                Err(e) => self.0.on_error(e.into())
+                Err(e) => self.0.on_error(e.into(), &**scope)
             }
         }
 
@@ -526,15 +622,27 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
             events
         };
 
+        let was_init = match self.0.state {
+            State::Init { .. } => true,
+            _ => false
+        };
+
         if events.is_readable() {
             self.0.on_readable(scope);
+        }
+
+        if events.is_hup() {
+            trace!("Conn::ready got hangup");
+            let _ = scope.deregister(&self.0.transport);
+            self.on_remove();
+            return ReadyResult::Done(None);
         }
 
         if events.is_writable() {
             self.0.on_writable(scope);
         }
 
-        let events = match self.0.register() {
+        let mut events = match self.0.register() {
             Reg::Read => EventSet::readable(),
             Reg::Write => EventSet::writable(),
             Reg::ReadWrite => EventSet::readable() | EventSet::writable(),
@@ -543,24 +651,26 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
                 trace!("removing transport");
                 let _ = scope.deregister(&self.0.transport);
                 self.on_remove();
-                return None;
+                return ReadyResult::Done(None);
             },
         };
 
-        if events.is_readable() && self.0.can_read_more() {
-            return self.ready(events, scope);
+        if events.is_readable() && self.0.can_read_more(was_init) {
+            return ReadyResult::Continue(self);
         }
+
+        events = events | EventSet::hup();
 
         trace!("scope.reregister({:?})", events);
         match scope.reregister(&self.0.transport, events, PollOpt::level()) {
             Ok(..) => {
                 let timeout = self.0.state.timeout();
-                Some((self, timeout))
+                ReadyResult::Done(Some((self, timeout)))
             },
             Err(e) => {
                 trace!("error reregistering: {:?}", e);
-                self.0.on_error(e.into());
-                None
+                self.0.on_error(e.into(), &**scope);
+                ReadyResult::Done(None)
             }
         }
     }
@@ -569,26 +679,64 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
     where F: MessageHandlerFactory<K, T, Output=H> {
         while let Ok(next) = self.0.ctrl.1.try_recv() {
             trace!("woke up with {:?}", next);
-            self.0.state.update(next);
+            let timeout_start = self.0.state.timeout_start();
+            self.0.state.update(next, &**scope, timeout_start);
         }
-        self.ready(EventSet::readable() | EventSet::writable(), scope)
+
+        let mut conn = Some(self);
+        loop {
+            match conn.take().unwrap().ready(EventSet::readable() | EventSet::writable(), scope) {
+                ReadyResult::Done(val) => return val,
+                ReadyResult::Continue(c) => conn = Some(c),
+            }
+        }
     }
 
     pub fn timeout<F>(mut self, scope: &mut Scope<F>) -> Option<(Self, Option<Duration>)>
     where F: MessageHandlerFactory<K, T, Output=H> {
-        //TODO: check if this was a spurious timeout?
-        self.0.on_error(::Error::Timeout);
-        self.ready(EventSet::none(), scope)
+        // Run error handler if timeout has elapsed
+        if self.0.state.timeout_elapsed(scope.now()) {
+            self.0.on_error(::Error::Timeout, &**scope);
+        }
+
+        let mut conn = Some(self);
+        loop {
+            match conn.take().unwrap().ready(EventSet::none(), scope) {
+                ReadyResult::Done(val) => return val,
+                ReadyResult::Continue(c) => conn = Some(c),
+            }
+        }
     }
 
     fn on_remove(self) {
         self.0.on_remove()
     }
 
+    pub fn key(&self) -> &K {
+        &self.0.key
+    }
+
+    pub fn control(&self) -> Control {
+        Control {
+            tx: self.0.ctrl.0.clone(),
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        if let State::Init { interest: Next_::Wait, .. } = self.0.state {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 enum State<H: MessageHandler<T>, T: Transport> {
-    Init,
+    Init {
+        interest: Next_,
+        timeout: Option<Duration>,
+        timeout_start: Option<Time>,
+    },
     /// Http1 will only ever use a connection to send and receive a single
     /// message at a time. Once a H1 status has been determined, we will either
     /// be reading or writing an H1 message, and optionally multiple if
@@ -602,13 +750,56 @@ enum State<H: MessageHandler<T>, T: Transport> {
     Closed,
 }
 
+/// Given two rotor::Time and a duration, see if the duration has elapsed.
+///
+/// The rotor::Time type only implements Add<Duration>, doesn't provide an API for comparing
+/// itself with other rotor::Time, and it doesn't implement arithmetic operations with itself.
+///
+/// `Time` is just a newtype around (u64). Since there's no other way to compare them, we'll just
+/// use this knowledge to actually do a comparison.
+fn timeout_elapsed(timeout: Duration, start: Time, now: Time) -> bool {
+    // type annotation for sanity
+    let timeout_at: rotor::Time = start + timeout;
+
+    let timeout_at: u64 = unsafe { mem::transmute(timeout_at) };
+    let now: u64 = unsafe { mem::transmute(now) };
+
+    if now >= timeout_at {
+        true
+    } else {
+        false
+    }
+}
+
 
 impl<H: MessageHandler<T>, T: Transport> State<H, T> {
     fn timeout(&self) -> Option<Duration> {
         match *self {
-            State::Init => None,
+            State::Init { timeout, .. } => timeout,
             State::Http1(ref http1) => http1.timeout,
             State::Closed => None,
+        }
+    }
+
+    fn timeout_start(&self) -> Option<Time> {
+        match *self {
+            State::Init { timeout_start, .. } => timeout_start,
+            State::Http1(ref http1) => http1.timeout_start,
+            State::Closed => None,
+        }
+    }
+
+    fn timeout_elapsed(&self, now: Time) -> bool {
+        match *self {
+            State::Init { timeout, timeout_start, .. } => {
+                if let (Some(timeout), Some(start)) = (timeout, timeout_start) {
+                    timeout_elapsed(timeout, start, now)
+                } else {
+                    false
+                }
+            },
+            State::Http1(ref http1) => http1.timeout_elapsed(now),
+            State::Closed => false,
         }
     }
 }
@@ -616,7 +807,11 @@ impl<H: MessageHandler<T>, T: Transport> State<H, T> {
 impl<H: MessageHandler<T>, T: Transport> fmt::Debug for State<H, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            State::Init => f.write_str("Init"),
+            State::Init { interest, timeout, timeout_start } => f.debug_struct("Init")
+                .field("interest", &interest)
+                .field("timeout", &timeout)
+                .field("timeout_start", &timeout_start)
+                .finish(),
             State::Http1(ref h1) => f.debug_tuple("Http1")
                 .field(h1)
                 .finish(),
@@ -626,194 +821,203 @@ impl<H: MessageHandler<T>, T: Transport> fmt::Debug for State<H, T> {
 }
 
 impl<H: MessageHandler<T>, T: Transport> State<H, T> {
-    fn update(&mut self, next: Next) {
-        let timeout = next.timeout;
-        let state = mem::replace(self, State::Closed);
-        let new_state = match (state, next.interest) {
-            (_, Next_::Remove) => State::Closed,
-            (State::Closed, _) => State::Closed,
-            (State::Init, _) => State::Init,
-            (State::Http1(http1), Next_::End) => {
-                let reading = match http1.reading {
-                    Reading::Body(ref decoder) if decoder.is_eof() => {
-                        if http1.keep_alive {
-                            Reading::KeepAlive
-                        } else {
-                            Reading::Closed
-                        }
-                    },
-                    Reading::KeepAlive => http1.reading,
-                    _ => Reading::Closed,
-                };
-                let writing = match http1.writing {
-                    Writing::Ready(encoder) => {
-                        if encoder.is_eof() {
-                            if http1.keep_alive {
-                                Writing::KeepAlive
-                            } else {
-                                Writing::Closed
-                            }
-                        } else if let Some(buf) = encoder.finish() {
-                            Writing::Chunk(Chunk {
-                                buf: buf.bytes,
-                                pos: buf.pos,
-                                next: (h1::Encoder::length(0), Next::end())
-                            })
-                        } else {
-                            Writing::Closed
-                        }
-                    }
-                    Writing::Chunk(mut chunk) => {
-                        if chunk.is_written() {
-                            let encoder = chunk.next.0;
-                            //TODO: de-dupe this code and from  Writing::Ready
-                            if encoder.is_eof() {
-                                if http1.keep_alive {
-                                    Writing::KeepAlive
-                                } else {
-                                    Writing::Closed
-                                }
-                            } else if let Some(buf) = encoder.finish() {
-                                Writing::Chunk(Chunk {
-                                    buf: buf.bytes,
-                                    pos: buf.pos,
-                                    next: (h1::Encoder::length(0), Next::end())
-                                })
-                            } else {
-                                Writing::Closed
-                            }
-                        } else {
-                            chunk.next.1 = next;
-                            Writing::Chunk(chunk)
-                        }
-                    },
-                    _ => Writing::Closed,
-                };
-                match (reading, writing) {
-                    (Reading::KeepAlive, Writing::KeepAlive) => {
-                        //http1.handler.on_keep_alive();
-                        State::Init
-                    },
-                    (reading, Writing::Chunk(chunk)) => {
-                        State::Http1(Http1 {
-                            reading: reading,
-                            writing: Writing::Chunk(chunk),
-                            .. http1
-                        })
-                    }
-                    _ => State::Closed
+    fn update<F, K>(&mut self, next: Next, factory: &F, timeout_start: Option<Time>)
+            where F: MessageHandlerFactory<K, T>,
+                  K: Key
+        {
+            let timeout = next.timeout;
+            let state = mem::replace(self, State::Closed);
+            trace!("State::update state={:?}, interest={:?}", state, next.interest);
+            match (state, next.interest) {
+                (_, Next_::Remove) |
+                (State::Closed, _) => return, // Keep State::Closed.
+                (State::Init { .. }, e) => {
+                    mem::replace(self,
+                                 State::Init {
+                                     interest: e,
+                                     timeout: timeout,
+                                     timeout_start: timeout_start,
+                                 });
                 }
-            },
-            (State::Http1(mut http1), Next_::Read) => {
-                http1.reading = match http1.reading {
-                    Reading::Init => Reading::Parse,
-                    Reading::Wait(decoder) => Reading::Body(decoder),
-                    same => same
-                };
+                (State::Http1(mut http1), next_) => {
+                    match next_ {
+                        Next_::Remove => unreachable!(), // Covered in (_, Next_::Remove) case above.
+                        Next_::End => {
+                            let reading = match http1.reading {
+                                Reading::Body(ref decoder) |
+                                Reading::Wait(ref decoder) if decoder.is_eof() => {
+                                    if http1.keep_alive {
+                                        Reading::KeepAlive
+                                    } else {
+                                        Reading::Closed
+                                    }
+                                }
+                                Reading::KeepAlive => http1.reading,
+                                _ => Reading::Closed,
+                            };
+                            let mut writing = Writing::Closed;
+                            let encoder = match http1.writing {
+                                Writing::Wait(enc) |
+                                Writing::Ready(enc) => Some(enc),
+                                Writing::Chunk(mut chunk) => {
+                                    if chunk.is_written() {
+                                        Some(chunk.next.0)
+                                    } else {
+                                        chunk.next.1 = next;
+                                        writing = Writing::Chunk(chunk);
+                                        None
+                                    }
+                                }
+                                Writing::KeepAlive => {
+                                    writing = Writing::KeepAlive;
+                                    None
+                                }
+                                _ => return, // Keep State::Closed.
+                            };
+                            if let Some(encoder) = encoder {
+                                if encoder.is_eof() {
+                                    if http1.keep_alive {
+                                        writing = Writing::KeepAlive
+                                    }
+                                } else if let Some(buf) = encoder.finish() {
+                                    writing = Writing::Chunk(Chunk {
+                                        buf: buf.bytes,
+                                        pos: buf.pos,
+                                        next: (h1::Encoder::length(0), Next::end()),
+                                    })
+                                }
+                            };
 
-                http1.writing = match http1.writing {
-                    Writing::Ready(encoder) => {
-                        if encoder.is_eof() {
-                            if http1.keep_alive {
-                                Writing::KeepAlive
-                            } else {
-                                Writing::Closed
+                            trace!("(reading, writing) -> {:?}", (&reading, &writing));
+                            match (reading, writing) {
+                                (Reading::KeepAlive, Writing::KeepAlive) => {
+                                    let next = factory.keep_alive_interest();
+                                    mem::replace(self,
+                                                 State::Init {
+                                                     interest: next.interest,
+                                                     timeout: next.timeout,
+                                                     timeout_start: timeout_start,
+                                                 });
+                                    return;
+                                }
+                                (reading, Writing::Chunk(chunk)) => {
+                                    http1.reading = reading;
+                                    http1.writing = Writing::Chunk(chunk);
+                                }
+                                _ => return, // Keep State::Closed.
                             }
-                        } else if encoder.is_closed() {
-                            if let Some(buf) = encoder.finish() {
-                                Writing::Chunk(Chunk {
-                                    buf: buf.bytes,
-                                    pos: buf.pos,
-                                    next: (h1::Encoder::length(0), Next::wait())
-                                })
-                            } else {
-                                Writing::Closed
-                            }
-                        } else {
-                            Writing::Wait(encoder)
                         }
-                    },
-                    Writing::Chunk(chunk) => if chunk.is_written() {
-                        Writing::Wait(chunk.next.0)
-                    } else {
-                        Writing::Chunk(chunk)
-                    },
-                    same => same
-                };
+                        Next_::Read => {
+                            http1.reading = match http1.reading {
+                                Reading::Init => Reading::Parse,
+                                Reading::Wait(decoder) => Reading::Body(decoder),
+                                same => same,
+                            };
 
-                State::Http1(http1)
-            },
-            (State::Http1(mut http1), Next_::Write) => {
-                http1.writing = match http1.writing {
-                    Writing::Wait(encoder) => Writing::Ready(encoder),
-                    Writing::Init => Writing::Head,
-                    Writing::Chunk(chunk) => if chunk.is_written() {
-                        Writing::Ready(chunk.next.0)
-                    } else {
-                        Writing::Chunk(chunk)
-                    },
-                    same => same
-                };
-
-                http1.reading = match http1.reading {
-                    Reading::Body(decoder) => if decoder.is_eof() {
-                        if http1.keep_alive {
-                            Reading::KeepAlive
-                        } else {
-                            Reading::Closed
+                            http1.writing = match http1.writing {
+                                Writing::Ready(encoder) => {
+                                    if encoder.is_eof() {
+                                        if http1.keep_alive {
+                                            Writing::KeepAlive
+                                        } else {
+                                            Writing::Closed
+                                        }
+                                    } else if encoder.is_closed() {
+                                        if let Some(buf) = encoder.finish() {
+                                            Writing::Chunk(Chunk {
+                                                buf: buf.bytes,
+                                                pos: buf.pos,
+                                                next: (h1::Encoder::length(0), Next::wait()),
+                                            })
+                                        } else {
+                                            Writing::Closed
+                                        }
+                                    } else {
+                                        Writing::Wait(encoder)
+                                    }
+                                }
+                                Writing::Chunk(chunk) => {
+                                    if chunk.is_written() {
+                                        Writing::Wait(chunk.next.0)
+                                    } else {
+                                        Writing::Chunk(chunk)
+                                    }
+                                }
+                                same => same,
+                            };
                         }
-                    } else {
-                        Reading::Wait(decoder)
-                    },
-                    same => same
-                };
-                State::Http1(http1)
-            },
-            (State::Http1(mut http1), Next_::ReadWrite) => {
-                http1.reading = match http1.reading {
-                    Reading::Init => Reading::Parse,
-                    Reading::Wait(decoder) => Reading::Body(decoder),
-                    same => same
-                };
-                http1.writing = match http1.writing {
-                    Writing::Wait(encoder) => Writing::Ready(encoder),
-                    Writing::Init => Writing::Head,
-                    Writing::Chunk(chunk) => if chunk.is_written() {
-                        Writing::Ready(chunk.next.0)
-                    } else {
-                        Writing::Chunk(chunk)
-                    },
-                    same => same
-                };
-                State::Http1(http1)
-            },
-            (State::Http1(mut http1), Next_::Wait) => {
-                http1.reading = match http1.reading {
-                    Reading::Body(decoder) => Reading::Wait(decoder),
-                    same => same
-                };
+                        Next_::Write => {
+                            http1.writing = match http1.writing {
+                                Writing::Wait(encoder) => Writing::Ready(encoder),
+                                Writing::Init => Writing::Head,
+                                Writing::Chunk(chunk) => {
+                                    if chunk.is_written() {
+                                        Writing::Ready(chunk.next.0)
+                                    } else {
+                                        Writing::Chunk(chunk)
+                                    }
+                                }
+                                same => same,
+                            };
 
-                http1.writing = match http1.writing {
-                    Writing::Ready(encoder) => Writing::Wait(encoder),
-                    Writing::Chunk(chunk) => if chunk.is_written() {
-                        Writing::Wait(chunk.next.0)
-                    } else {
-                        Writing::Chunk(chunk)
-                    },
-                    same => same
-                };
-                State::Http1(http1)
-            }
-        };
-        let new_state = match new_state {
-            State::Http1(mut http1) => {
-                http1.timeout = timeout;
-                State::Http1(http1)
-            }
-            other => other
-        };
-        mem::replace(self, new_state);
-    }
+                            http1.reading = match http1.reading {
+                                Reading::Body(decoder) => {
+                                    if decoder.is_eof() {
+                                        if http1.keep_alive {
+                                            Reading::KeepAlive
+                                        } else {
+                                            Reading::Closed
+                                        }
+                                    } else {
+                                        Reading::Wait(decoder)
+                                    }
+                                }
+                                same => same,
+                            };
+                        }
+                        Next_::ReadWrite => {
+                            http1.reading = match http1.reading {
+                                Reading::Init => Reading::Parse,
+                                Reading::Wait(decoder) => Reading::Body(decoder),
+                                same => same,
+                            };
+                            http1.writing = match http1.writing {
+                                Writing::Wait(encoder) => Writing::Ready(encoder),
+                                Writing::Init => Writing::Head,
+                                Writing::Chunk(chunk) => {
+                                    if chunk.is_written() {
+                                        Writing::Ready(chunk.next.0)
+                                    } else {
+                                        Writing::Chunk(chunk)
+                                    }
+                                }
+                                same => same,
+                            };
+                        }
+                        Next_::Wait => {
+                            http1.reading = match http1.reading {
+                                Reading::Body(decoder) => Reading::Wait(decoder),
+                                same => same,
+                            };
+
+                            http1.writing = match http1.writing {
+                                Writing::Ready(encoder) => Writing::Wait(encoder),
+                                Writing::Chunk(chunk) => {
+                                    if chunk.is_written() {
+                                        Writing::Wait(chunk.next.0)
+                                    } else {
+                                        Writing::Chunk(chunk)
+                                    }
+                                }
+                                same => same,
+                            };
+                        }
+                    }
+                    http1.timeout = timeout;
+                    mem::replace(self, State::Http1(http1));
+                }
+            };
+        }
 }
 
 // These Reading and Writing stuff should probably get moved into h1/message.rs
@@ -824,7 +1028,18 @@ struct Http1<H, T> {
     writing: Writing,
     keep_alive: bool,
     timeout: Option<Duration>,
+    timeout_start: Option<Time>,
     _marker: PhantomData<T>,
+}
+
+impl<H, T> Http1<H, T> {
+    fn timeout_elapsed(&self, now: Time) -> bool {
+        if let (Some(timeout), Some(start)) = (self.timeout, self.timeout_start) {
+            timeout_elapsed(timeout, start, now)
+        } else {
+            false
+        }
+    }
 }
 
 impl<H, T> fmt::Debug for Http1<H, T> {
@@ -901,22 +1116,13 @@ impl<'a, K: Key + 'a> Seed<'a, K> {
 pub trait MessageHandlerFactory<K: Key, T: Transport> {
     type Output: MessageHandler<T>;
 
-    fn create(&mut self, seed: Seed<K>) -> Self::Output;
+    fn create(&mut self, seed: Seed<K>) -> Option<Self::Output>;
+
+    fn keep_alive_interest(&self) -> Next;
 }
 
-impl<F, K, H, T> MessageHandlerFactory<K, T> for F
-where F: FnMut(Seed<K>) -> H,
-      K: Key,
-      H: MessageHandler<T>,
-      T: Transport {
-    type Output = H;
-    fn create(&mut self, seed: Seed<K>) -> H {
-        self(seed)
-    }
-}
-
-pub trait Key: Eq + Hash + Clone {}
-impl<T: Eq + Hash + Clone> Key for T {}
+pub trait Key: Eq + Hash + Clone + fmt::Debug {}
+impl<T: Eq + Hash + Clone + fmt::Debug> Key for T {}
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,7 @@
 [package]
 
 name = "hyper"
-version = "0.9.4"
+version = "0.10.0-a.0"
 description = "A modern HTTP library."
 readme = "README.md"
 documentation = "http://hyperium.github.io/hyper"
@@ -20,14 +20,12 @@ rotor = { git = "https://github.com/ethcore/rotor" }
 rustc-serialize = "0.3"
 spmc = "0.2.1"
 time = "0.1"
-traitobject = "0.0.1"
-typeable = "0.1"
 unicase = "1.0"
 url = "1.0"
 vecio = "0.1"
 
 [dependencies.cookie]
-version = "0.2"
+version = "0.3"
 default-features = false
 
 [dependencies.openssl]
@@ -43,15 +41,15 @@ version = "0.1.4"
 optional = true
 
 [dependencies.serde]
-version = "0.7"
+version = "0.8"
 optional = true
 
 [dev-dependencies]
 env_logger = "0.3"
-num_cpus = "0.2"
+num_cpus = "1.0"
 
 [features]
 default = ["ssl"]
-ssl = ["openssl", "openssl-verify", "cookie/secure"]
+ssl = ["openssl", "openssl-verify"]
 serde-serialization = ["serde", "mime/serde"]
 nightly = []
