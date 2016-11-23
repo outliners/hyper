@@ -4,7 +4,7 @@ use std::net::{SocketAddr};
 use std::option;
 
 use rotor::mio::tcp::{TcpStream, TcpListener};
-use rotor::mio::{Selector, Token, Evented, EventSet, PollOpt, TryAccept};
+use rotor::mio::{Token, Evented, PollOpt, Poll as Selector, Ready as EventSet};
 
 #[cfg(feature = "openssl")]
 pub use self::openssl::{Openssl, OpensslStream};
@@ -71,7 +71,10 @@ pub struct HttpStream(pub TcpStream);
 
 impl Transport for HttpStream {
     fn take_socket_error(&mut self) -> io::Result<()> {
-        self.0.take_socket_error()
+        self.0.take_error().and_then(|result| match result {
+          Some(e) => Err(e),
+          None => Ok(()),
+        })
     }
 }
 
@@ -96,17 +99,17 @@ impl Write for HttpStream {
 
 impl Evented for HttpStream {
     #[inline]
-    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn register(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         self.0.register(selector, token, interest, opts)
     }
 
     #[inline]
-    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn reregister(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         self.0.reregister(selector, token, interest, opts)
     }
 
     #[inline]
-    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+    fn deregister(&self, selector: &Selector) -> io::Result<()> {
         self.0.deregister(selector)
     }
 }
@@ -143,7 +146,16 @@ impl Accept for HttpListener {
 
     #[inline]
     fn accept(&self) -> io::Result<Option<HttpStream>> {
-        TryAccept::accept(&self.0).map(|ok| ok.map(HttpStream))
+        match self.0.accept() {
+          Ok((ok, _)) => Ok(Some(HttpStream(ok))),
+          Err(e) => {
+            if e.kind() == io::ErrorKind::WouldBlock {
+              Ok(None)
+            } else {
+              Err(e)
+            }
+          },
+        }
     }
 
     #[inline]
@@ -154,17 +166,17 @@ impl Accept for HttpListener {
 
 impl Evented for HttpListener {
     #[inline]
-    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn register(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         self.0.register(selector, token, interest, opts)
     }
 
     #[inline]
-    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn reregister(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         self.0.reregister(selector, token, interest, opts)
     }
 
     #[inline]
-    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+    fn deregister(&self, selector: &Selector) -> io::Result<()> {
         self.0.deregister(selector)
     }
 }
@@ -292,7 +304,7 @@ impl<S: Transport + ::std::os::unix::io::AsRawFd> ::std::os::unix::io::AsRawFd f
 
 impl<S: Transport> Evented for HttpsStream<S> {
     #[inline]
-    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn register(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         match *self {
             HttpsStream::Http(ref s) => s.register(selector, token, interest, opts),
             HttpsStream::Https(ref s) => s.register(selector, token, interest, opts),
@@ -300,7 +312,7 @@ impl<S: Transport> Evented for HttpsStream<S> {
     }
 
     #[inline]
-    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn reregister(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         match *self {
             HttpsStream::Http(ref s) => s.reregister(selector, token, interest, opts),
             HttpsStream::Https(ref s) => s.reregister(selector, token, interest, opts),
@@ -308,7 +320,7 @@ impl<S: Transport> Evented for HttpsStream<S> {
     }
 
     #[inline]
-    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+    fn deregister(&self, selector: &Selector) -> io::Result<()> {
         match *self {
             HttpsStream::Http(ref s) => s.deregister(selector),
             HttpsStream::Https(ref s) => s.deregister(selector),
@@ -365,16 +377,24 @@ impl<S: SslServer> Accept for HttpsListener<S> {
 
     #[inline]
     fn accept(&self) -> io::Result<Option<S::Stream>> {
-        self.listener.accept().and_then(|s| match s {
-            Some((s, _)) => self.ssl.wrap_server(HttpStream(s)).map(Some).map_err(|e| {
+        match self.listener.accept() {
+          Ok((s, _)) => {
+            self.ssl.wrap_server(HttpStream(s)).map(Some).map_err(|e| {
                 match e {
                     ::Error::Io(e) => e,
                     _ => io::Error::new(io::ErrorKind::Other, e),
 
                 }
-            }),
-            None => Ok(None),
-        })
+            })
+          },
+          Err(e) => {
+            if e.kind() == io::ErrorKind::WouldBlock {
+              Ok(None)
+            } else {
+              Err(e)
+            }
+          },
+        }
     }
 
     #[inline]
@@ -385,17 +405,17 @@ impl<S: SslServer> Accept for HttpsListener<S> {
 
 impl<S: SslServer> Evented for HttpsListener<S> {
     #[inline]
-    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn register(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         self.listener.register(selector, token, interest, opts)
     }
 
     #[inline]
-    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+    fn reregister(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
         self.listener.reregister(selector, token, interest, opts)
     }
 
     #[inline]
-    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+    fn deregister(&self, selector: &Selector) -> io::Result<()> {
         self.listener.deregister(selector)
     }
 }
@@ -435,7 +455,7 @@ mod openssl {
     use std::io::{self, Write};
     use std::path::Path;
 
-    use rotor::mio::{Selector, Token, Evented, EventSet, PollOpt};
+    use rotor::mio::{Token, Evented, PollOpt, Poll as Selector, Ready as EventSet};
 
     use openssl::ssl::{Ssl, SslContext, SslStream, SslMethod, SSL_VERIFY_PEER, SSL_OP_NO_SSLV2, SSL_OP_NO_SSLV3, SSL_OP_NO_COMPRESSION};
     use openssl::ssl::error::StreamError as SslIoError;
@@ -610,17 +630,17 @@ mod openssl {
 
     impl<T: super::Transport> Evented for OpensslStream<T> {
         #[inline]
-        fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        fn register(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
             self.stream.get_ref().register(selector, token, interest, opts)
         }
 
         #[inline]
-        fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        fn reregister(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
             self.stream.get_ref().reregister(selector, token, interest, opts)
         }
 
         #[inline]
-        fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        fn deregister(&self, selector: &Selector) -> io::Result<()> {
             self.stream.get_ref().deregister(selector)
         }
     }
@@ -702,17 +722,17 @@ mod security_framework {
 
     impl<T: Transport> Evented for SecureTransport<T> {
         #[inline]
-        fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        fn register(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
             self.0.get_ref().inner.register(selector, token, interest, opts)
         }
 
         #[inline]
-        fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        fn reregister(&self, selector: &Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
             self.0.get_ref().inner.reregister(selector, token, interest, opts)
         }
 
         #[inline]
-        fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        fn deregister(&self, selector: &Selector) -> io::Result<()> {
             self.0.get_ref().inner.deregister(selector)
         }
     }
