@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rotor::mio::{EventSet, PollOpt};
+use rotor::mio::{Ready as EventSet, PollOpt};
 use rotor::{self, Scope};
 
 pub use self::request::Request;

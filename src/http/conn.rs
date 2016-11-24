@@ -661,6 +661,12 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
 
         events = events | EventSet::hup();
 
+        // TODO [ToDr] Mio does not allow to register non-readable, non-writeable events anymore.
+        if !events.is_readable() && !events.is_writable() {
+            let timeout = self.0.state.timeout();
+            return ReadyResult::Done(Some((self, timeout)))
+        }
+
         trace!("scope.reregister({:?})", events);
         match scope.reregister(&self.0.transport, events, PollOpt::level()) {
             Ok(..) => {
