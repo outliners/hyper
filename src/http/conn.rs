@@ -64,7 +64,7 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
         match self.state {
             State::Closed => Reg::Remove,
             State::Init => {
-                <H as MessageHandler>::Message::initial_interest().interest()
+                <H as MessageHandler<T>>::Message::initial_interest().interest()
             }
             State::Http1(Http1 { reading: Reading::Closed, writing: Writing::Closed, .. }) => {
                 Reg::Remove
