@@ -288,6 +288,11 @@ where A: Accept,
 
     }
 
+    fn spawn_error(self, _scope: &mut Scope<Self::Context>, error: rotor::SpawnError<Self::Seed>) -> rotor::Response<Self, Self::Seed> {
+      warn!("ignoring connection above current capacity: {:?}", error);
+      rotor::Response::done()
+    }
+
     fn timeout(self, scope: &mut Scope<Self::Context>) -> rotor::Response<Self, Self::Seed> {
         match self {
             ServerFsm::Listener(..) => unreachable!("Listener cannot timeout"),
