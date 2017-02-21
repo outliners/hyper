@@ -30,8 +30,8 @@ pub trait Connect {
     fn register(&mut self, Registration);
 }
 
-type Scheme = String;
-type Port = u16;
+// type Scheme = String;
+// type Port = u16;
 
 /// A connector for the `http` scheme.
 pub struct HttpConnector {

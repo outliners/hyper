@@ -320,6 +320,9 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
 
                         Some(http1.handler.on_decode(&mut Decoder::h1(decoder, wrapped)))
                     },
+                    Reading::Wait(ref decoder) if decoder.is_eof() => {
+                        Some(Next::new(Next_::Write))
+                    },
                     _ => {
                         trace!("Conn.on_readable State::Http1(reading = {:?})", http1.reading);
                         None
@@ -627,15 +630,15 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> Conn<K, T, H> {
             _ => false
         };
 
-        if events.is_readable() {
-            self.0.on_readable(scope);
-        }
-
         if events.is_hup() {
             trace!("Conn::ready got hangup");
             let _ = scope.deregister(&self.0.transport);
             self.on_remove();
             return ReadyResult::Done(None);
+        }
+
+        if events.is_readable() {
+            self.0.on_readable(scope);
         }
 
         if events.is_writable() {
