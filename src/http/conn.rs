@@ -320,9 +320,6 @@ impl<K: Key, T: Transport, H: MessageHandler<T>> ConnInner<K, T, H> {
 
                         Some(http1.handler.on_decode(&mut Decoder::h1(decoder, wrapped)))
                     },
-                    Reading::Wait(ref decoder) if decoder.is_eof() => {
-                        Some(Next::new(Next_::Write))
-                    },
                     _ => {
                         trace!("Conn.on_readable State::Http1(reading = {:?})", http1.reading);
                         None
