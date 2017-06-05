@@ -1,7 +1,9 @@
 #![doc(html_root_url = "https://hyperium.github.io/hyper/")]
 #![deny(missing_docs)]
-#![deny(warnings)]
 #![deny(missing_debug_implementations)]
+#![deny(warnings)]
+#![allow(deprecated)] // new mio stuff
+#![allow(unused_imports)] // macro_use of language_tags
 #![cfg_attr(all(test, feature = "nightly"), feature(test))]
 
 //! # Hyper
